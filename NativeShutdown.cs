@@ -17,6 +17,7 @@ namespace QUpdater
         internal sealed record Credentials(string Username, string Password);
         internal enum Outcome { Unavailable, AuthenticationSkipped, AuthenticationFailed, Requested }
         private const int AF_INET = 2;
+        private const int AF_INET6 = 23;
         private const int TCP_TABLE_OWNER_PID_ALL = 5;
         private const int ERROR_INSUFFICIENT_BUFFER = 122;
         private const int MIB_TCP_STATE_ESTAB = 5;
@@ -82,11 +83,30 @@ namespace QUpdater
         // MIB_TCPROW_OWNER_PID contains six DWORDs. TCP ports are network-byte-order
         // in the low two bytes; IPv4 addresses are in network byte order in memory.
         private static int Port(int raw) => ((raw & 0xff) << 8) | ((raw >> 8) & 0xff);
-        private static bool OwnsConnectedPeer(int serverPort, int clientPort, int expectedPid)
+        private static bool AddressMatches(IntPtr table, int offset, IPAddress expected, bool ipv6)
+        {
+            byte[] bytes = new byte[ipv6 ? 16 : 4];
+            Marshal.Copy(IntPtr.Add(table, offset), bytes, 0, bytes.Length);
+            var actual = new IPAddress(bytes);
+            if (actual.IsIPv4MappedToIPv6) actual = actual.MapToIPv4();
+            return actual.Equals(expected);
+        }
+
+        private static bool OwnsConnectedPeer(IPAddress loopback, int serverPort, int clientPort, int expectedPid)
+        {
+            if (loopback.Equals(IPAddress.Loopback) &&
+                MatchTcpTable(AF_INET, loopback, serverPort, clientPort, expectedPid)) return true;
+            // Dual-stack listeners may report IPv4 clients as IPv4-mapped IPv6 addresses.
+            return MatchTcpTable(AF_INET6, loopback, serverPort, clientPort, expectedPid);
+        }
+
+        private static bool MatchTcpTable(int family, IPAddress loopback, int serverPort, int clientPort, int expectedPid)
         {
             int size = 0;
-            uint result = GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+            uint result = GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, TCP_TABLE_OWNER_PID_ALL, 0);
             if (result != ERROR_INSUFFICIENT_BUFFER) return false;
+            bool ipv6 = family == AF_INET6;
+            int rowSize = ipv6 ? 56 : 24;
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 if (size < 4 || size > 64 * 1024 * 1024) return false;
@@ -94,21 +114,20 @@ namespace QUpdater
                 IntPtr table = Marshal.AllocHGlobal(allocated);
                 try
                 {
-                    result = GetExtendedTcpTable(table, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                    result = GetExtendedTcpTable(table, ref size, false, family, TCP_TABLE_OWNER_PID_ALL, 0);
                     if (result == ERROR_INSUFFICIENT_BUFFER) continue;
                     if (result != 0) return false;
                     int count = Marshal.ReadInt32(table);
-                    if (count < 0 || count > (allocated - 4) / 24) return false;
-                    const int loopback = 0x0100007f; // 127.0.0.1 on little-endian Windows x64
+                    if (count < 0 || count > (allocated - 4) / rowSize) return false;
                     for (int i = 0; i < count; i++)
                     {
-                        int offset = 4 + i * 24;
-                        if (Marshal.ReadInt32(table, offset) == MIB_TCP_STATE_ESTAB &&
-                            Marshal.ReadInt32(table, offset + 4) == loopback &&
-                            Port(Marshal.ReadInt32(table, offset + 8)) == serverPort &&
-                            Marshal.ReadInt32(table, offset + 12) == loopback &&
-                            Port(Marshal.ReadInt32(table, offset + 16)) == clientPort &&
-                            Marshal.ReadInt32(table, offset + 20) == expectedPid)
+                        int offset = 4 + i * rowSize;
+                        if (Marshal.ReadInt32(table, offset + (ipv6 ? 48 : 0)) == MIB_TCP_STATE_ESTAB &&
+                            Marshal.ReadInt32(table, offset + (ipv6 ? 52 : 20)) == expectedPid &&
+                            Port(Marshal.ReadInt32(table, offset + (ipv6 ? 20 : 8))) == serverPort &&
+                            Port(Marshal.ReadInt32(table, offset + (ipv6 ? 44 : 16))) == clientPort &&
+                            AddressMatches(table, offset + (ipv6 ? 0 : 4), loopback, ipv6) &&
+                            AddressMatches(table, offset + (ipv6 ? 24 : 12), loopback, ipv6))
                             return true;
                     }
                     return false;
@@ -131,26 +150,29 @@ namespace QUpdater
             };
             handler.ConnectCallback = async (context, token) =>
             {
-                // Connect only to IPv4 loopback, without DNS or proxy resolution.
+                // Connect only to literal loopback addresses, without DNS or proxies.
                 if (context.DnsEndPoint.Host != "localhost" || context.DnsEndPoint.Port != settings.Port)
                     throw new IOException("Unexpected WebUI endpoint.");
-                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                try
+                foreach (var address in new[] { IPAddress.Loopback, IPAddress.IPv6Loopback })
                 {
-                    await socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, settings.Port), token).ConfigureAwait(false);
-                    int clientPort = ((IPEndPoint)socket.LocalEndPoint).Port;
-                    // Check the established server-side connection, not just the listening port,
-                    // before sending any HTTP request or credential.
-                    bool owned = false;
-                    for (int attempt = 0; attempt < 5; attempt++)
+                    var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    try
                     {
-                        if (OwnsConnectedPeer(settings.Port, clientPort, processId)) { owned = true; break; }
-                        await Task.Delay(25, token).ConfigureAwait(false);
+                        await socket.ConnectAsync(new IPEndPoint(address, settings.Port), token).ConfigureAwait(false);
+                        int clientPort = ((IPEndPoint)socket.LocalEndPoint).Port;
+                        // Verify server-side connection ownership before transmitting HTTP or TLS data.
+                        for (int attempt = 0; attempt < 5; attempt++)
+                        {
+                            if (OwnsConnectedPeer(address, settings.Port, clientPort, processId))
+                                return new NetworkStream(socket, ownsSocket: true);
+                            await Task.Delay(25, token).ConfigureAwait(false);
+                        }
+                        socket.Dispose();
                     }
-                    if (!owned) throw new IOException("Local WebUI connection is not owned by the expected qBittorrent process.");
-                    return new NetworkStream(socket, ownsSocket: true);
+                    catch (SocketException) { socket.Dispose(); }
+                    catch { socket.Dispose(); throw; }
                 }
-                catch { socket.Dispose(); throw; }
+                throw new IOException("Local WebUI connection is not owned by the expected qBittorrent process, or is unavailable.");
             };
             // Default TLS certificate validation remains active, including hostname validation.
             return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(8) };
@@ -260,6 +282,26 @@ namespace QUpdater
             }
         }
 
+        private static async Task<bool> TestConnectionOwnership(IPAddress address)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var listener = new TcpListener(address, 0);
+            listener.Start();
+            int serverPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+            using var client = new TcpClient(address.AddressFamily);
+            var accept = listener.AcceptTcpClientAsync(timeout.Token);
+            await client.ConnectAsync(address, serverPort, timeout.Token).ConfigureAwait(false);
+            using var peer = await accept.ConfigureAwait(false);
+            int clientPort = ((IPEndPoint)client.Client.LocalEndPoint).Port;
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                if (OwnsConnectedPeer(address, serverPort, clientPort, Environment.ProcessId))
+                    return !OwnsConnectedPeer(address, serverPort, clientPort, 0);
+                await Task.Delay(25, timeout.Token).ConfigureAwait(false);
+            }
+            return false;
+        }
+
         internal static int SelfTest()
         {
             try
@@ -271,6 +313,8 @@ namespace QUpdater
                     ParseSettings(new StringReader("[Other]\nWebUI\\Enabled=true")) != null ||
                     ParseSettings(new StringReader("[Preferences]\nWebUI\\Enabled=true\nWebUI\\Port=8080\nWebUI\\Port=8081")) != null ||
                     Port(0x901f) != 8080) return 1;
+                if (!TestConnectionOwnership(IPAddress.Loopback).GetAwaiter().GetResult()) return 1;
+                if (Socket.OSSupportsIPv6 && !TestConnectionOwnership(IPAddress.IPv6Loopback).GetAwaiter().GetResult()) return 1;
                 var endpoint = new Uri("http://localhost:8080/");
                 using var noAuth = new MockHandler(
                     (HttpMethod.Get, "/api/v2/app/version", HttpStatusCode.OK, "v5.3.1"),
