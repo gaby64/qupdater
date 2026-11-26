@@ -5,7 +5,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>icon.ico</ApplicationIcon>
     <AssemblyName>qUpdater</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>qUpdater</Authors>
     <Company>qUpdater</Company>
     <Description>Automatic updater for qBittorrent</Description>
@@ -27,5 +27,8 @@
 
   <ItemGroup>
     <EmbeddedResource Include="icon.ico" />
+    <EmbeddedResource Include="qbittorrent-signing-key.asc" LogicalName="QUpdater.qbittorrent-signing-key.asc" />
+    <EmbeddedResource Include="windows-release-fixture.html" LogicalName="QUpdater.windows-release-fixture.html" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
   </ItemGroup>
 </Project>

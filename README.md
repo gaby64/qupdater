@@ -1,17 +1,20 @@
-# qUpdater – security-hardening draft
+# qUpdater – standalone security-hardening draft
 
-Fork of [celgost/qupdater](https://github.com/celgost/qupdater). Original attribution retained. No separate upstream license file was found; no new license is asserted. Confirm redistribution rights with the upstream author before distributing builds outside the GitHub fork.
+Fork of [celgost/qupdater](https://github.com/celgost/qupdater). No upstream license file was found; confirm redistribution rights with the original author before distributing builds outside the GitHub fork.
 
-Checks for stable qBittorrent updates at startup and from the Windows tray. SourceForge provides a version hint only; Windows Package Manager performs the update using the exact qBittorrent.qBittorrent package from the winget source and its installer hash verification. No direct installer execution, hash override, or forced qBittorrent termination. This design relies on WinGet and its configured source; it does not independently pin or verify an Authenticode publisher.
+## Direct updates (default)
 
-## Requirements and installation
+Checks the official Windows download page for stable x64 releases and exact installer/signature links and SHA-256 values. Downloads from HTTPS SourceForge mirrors only, follows at most five validated redirects, bounds download sizes and times, verifies SHA-256 AND the detached OpenPGP binary signature against the embedded primary public key fingerprint D8F3DA77AAC6741053599C136E4A2D025B7CC9A2 (published at https://www.qbittorrent.org/download). The key file is taken from the upstream qBittorrent repository. Unknown key rotations, signing subkeys, weak digests, missing metadata, signature mismatches, or unexpected mirrors stop the update; there is no automatic fallback or bypass. OpenPGP verifies publisher identity independently of Authenticode, which upstream installers may lack. This does not guarantee absence of vulnerabilities or malware in an authentic upstream release. The Windows zone marker is retained; Windows protections and UAC remain in effect.
 
-- Windows x64, current Windows App Installer (WinGet), and an existing qBittorrent installation recognized by WinGet.
-- For local compilation, install the .NET 10 SDK and run build.bat.
-- For migration, exit the old updater first. The previous Program Files installation is not automatically removed; remove it manually if appropriate.
-- Run install.bat as your normal user. Startup is registered for your account only.
-- Exit via the tray and run uninstall.bat to remove the new installation. Logs are retained in %LOCALAPPDATA%\qUpdater.
+The user selects the existing libtorrent variant on first update (standard, lt12, or lt20 if offered); no automatic switching. The tray offers startup-only, six-hour, and daily checks, optional restart after successful installation, and an explicit WinGet alternative for standard builds. Direct updates do not need WinGet or GnuPG. Downloads can be canceled, one transient HTTP failure is retried, files are removed after completion, and verification finishes before attempting graceful shutdown. If qBittorrent remains in the tray, exit it manually and retry. The official interactive NSIS installer receives the existing directory as its initial destination; the user should leave it unchanged. Success is confirmed by reading the executable version at that path. No qBittorrent process is forcibly terminated. Optional restart only occurs after direct update success if qBittorrent was previously running. Logs rotate in %LOCALAPPDATA%\qUpdater.
 
-## Validation before production use
+## Build and install
 
-Windows CI publishes a self-contained executable and checks stable release filename parsing. This is not an end-to-end installation test. Test on a VM: no-update startup, update refusal, unavailable WinGet/source, network failure, a tray-minimized qBittorrent that refuses to exit, canceled UAC, successful upgrade and installed-version verification, and install/uninstall without elevation. An update may be deferred until the requested version reaches WinGet. The WinGet installer may show its own UI and elevation prompt. No automatic application restart is attempted. WinGet source agreements may need to be accepted manually in a terminal first.
+Windows x64, .NET 10 SDK for local builds; run build.bat, then install.bat as a normal user. WinGet is optional. The self-contained build uses BouncyCastle.Cryptography 2.7.0 for OpenPGP. Exit the old updater first; old Program Files installation is not automatically removed. Exit from the tray before uninstall.bat. Settings and logs remain. Portable/nonstandard installations and multi-user installation coordination are not supported.
+
+## Validation
+
+Windows CI publishes a self-contained executable and runs parser, pinned-key, URL rejection and hash mismatch smoke tests. The HTML test fixture is a snapshot of the official Windows release section, not runtime metadata. This is not an end-to-end installer test. Before production use, test real downloads and signatures for each variant, tampered signatures, truncated downloads, cancellation, redirect behavior, graceful shutdown when minimized, installer UAC refusal, original path preservation, successful upgrade/restart, and installation/uninstallation in a Windows VM. The pinned key must be updated through a reviewed source change if upstream changes signing keys. No live revocation/keyserver checks are made. If SourceForge changes mirror domains or the official page changes markup, direct updates fail closed until the parser or allowlist is reviewed.
+
+Upstream key: https://github.com/qbittorrent/qBittorrent/blob/master/5B7CC9A2.asc
+Website fixture: https://github.com/qbittorrent/qBittorrent-website/blob/master/_site/download.html
