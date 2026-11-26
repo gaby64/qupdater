@@ -20,7 +20,7 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Publish Windows x64
         run: dotnet publish QUpdater.csproj -c Release -r win-x64 --self-contained true -o publish
-      - name: Security parser and key smoke tests
+      - name: Security and native WebUI shutdown smoke tests
         shell: pwsh
         run: |
           $test = Start-Process -FilePath (Resolve-Path publish/qUpdater.exe).Path -ArgumentList '--self-test' -Wait -PassThru

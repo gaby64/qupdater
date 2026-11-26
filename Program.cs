@@ -48,7 +48,7 @@ namespace QUpdater
         static int Main(string[] args)
         {
             if (args.Length == 1 && args[0] == "--self-test")
-                return SecureRelease.SelfTest();
+                return SecureRelease.SelfTest() == 0 && NativeShutdown.SelfTest() == 0 ? 0 : 1;
             using var mutex = new Mutex(true, @"Local\qUpdater.SecurityHardened", out bool firstInstance);
             if (!firstInstance) return 0;
             Application.EnableVisualStyles();
@@ -482,23 +482,94 @@ namespace QUpdater
             finally { foreach (var process in processes) process.Dispose(); }
         }
 
-        private static async Task<bool> CloseQbittorrentGracefully()
+        private static bool IsTargetProcess(Process process, string executable)
+        {
+            try
+            {
+                using var self = Process.GetCurrentProcess();
+                return !process.HasExited && process.SessionId == self.SessionId &&
+                    string.Equals(process.MainModule?.FileName, executable, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (InvalidOperationException) { return false; }
+            catch (System.ComponentModel.Win32Exception) { return false; }
+        }
+
+        private static NativeShutdown.Credentials PromptWebUiCredentials(string username, Uri endpoint)
+        {
+            using var form = new Form { Text = "qBittorrent WebUI authentication", Size = new Size(470, 250),
+                StartPosition = FormStartPosition.CenterScreen, FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false, MinimizeBox = false };
+            form.Controls.Add(new Label { Text = $"qBittorrent requires authentication at {endpoint.GetLeftPart(UriPartial.Authority)}.\nCredentials are used only for this shutdown request.",
+                AutoSize = true, Location = new Point(12, 12) });
+            form.Controls.Add(new Label { Text = "Username", AutoSize = true, Location = new Point(12, 67) });
+            var user = new TextBox { Text = username, Location = new Point(112, 64), Width = 325 };
+            form.Controls.Add(user);
+            form.Controls.Add(new Label { Text = "Password", AutoSize = true, Location = new Point(12, 105) });
+            var password = new TextBox { UseSystemPasswordChar = true, Location = new Point(112, 102), Width = 325 };
+            form.Controls.Add(password);
+            var ok = new Button { Text = "Log in", DialogResult = DialogResult.OK, Location = new Point(257, 148), Enabled = user.TextLength > 0 };
+            user.TextChanged += (s, e) => ok.Enabled = user.TextLength > 0;
+            var skip = new Button { Text = "Skip", DialogResult = DialogResult.Cancel, Location = new Point(342, 148) };
+            form.Controls.AddRange(new Control[] { ok, skip });
+            form.AcceptButton = ok;
+            form.CancelButton = skip;
+            form.ActiveControl = password;
+            if (form.ShowDialog() != DialogResult.OK) return null;
+            var credentials = new NativeShutdown.Credentials(user.Text, password.Text);
+            password.Clear();
+            return credentials;
+        }
+
+        private static async Task<bool> WaitForQbittorrentExit(int seconds)
+        {
+            for (int attempt = 0; attempt < seconds; attempt++)
+            {
+                if (!QbittorrentRunning()) return true;
+                await Task.Delay(1000);
+            }
+            return !QbittorrentRunning();
+        }
+
+        private static async Task<bool> CloseQbittorrentGracefully(string executable)
         {
             var processes = Process.GetProcessesByName("qbittorrent");
             try
             {
-                foreach (var process in processes)
+                if (processes.Length == 0) return true;
+                // Never send shutdown requests to another session or installation.
+                var targets = Array.FindAll(processes, process => IsTargetProcess(process, executable));
+                if (targets.Length != processes.Length)
                 {
-                    try { if (!process.HasExited) process.CloseMainWindow(); }
+                    Log("Another or inaccessible qBittorrent instance is running. Update deferred.");
+                    return false;
+                }
+
+                var settings = NativeShutdown.ReadSettings();
+                if (settings != null)
+                {
+                    foreach (var process in targets)
+                    {
+                        if (!IsTargetProcess(process, executable)) continue;
+                        var result = await NativeShutdown.TryShutdownAsync(settings, process.Id, PromptWebUiCredentials);
+                        Log("Native WebUI shutdown: " + result);
+                        if (result == NativeShutdown.Outcome.Requested)
+                        {
+                            // qBittorrent may need time to save resume data and flush disk I/O.
+                            // Do not send a second close request if native shutdown is already underway.
+                            return await WaitForQbittorrentExit(60);
+                        }
+                    }
+                }
+                else Log("WebUI not enabled or normal-profile settings unavailable.");
+
+                // Fall back to WM_CLOSE, which may only minimize the app to the tray.
+                foreach (var process in targets)
+                {
+                    try { if (IsTargetProcess(process, executable)) process.CloseMainWindow(); }
                     catch (InvalidOperationException) { }
                     catch (System.ComponentModel.Win32Exception) { }
                 }
-                for (var attempt = 0; attempt < 30; attempt++)
-                {
-                    if (!QbittorrentRunning()) return true;
-                    await Task.Delay(1000);
-                }
-                return !QbittorrentRunning();
+                return await WaitForQbittorrentExit(30);
             }
             finally { foreach (var process in processes) process.Dispose(); }
         }
@@ -515,7 +586,7 @@ namespace QUpdater
                 "--version", version.ToString(), "--disable-interactivity") != 0)
                 throw new InvalidOperationException("This version is unavailable through WinGet, or its source needs setup. Run winget source update in a terminal and retry.");
 
-            if (!await CloseQbittorrentGracefully())
+            if (!await CloseQbittorrentGracefully(ResolveInstalledExecutable()))
             {
                 MessageBox.Show("qBittorrent is still running. Exit using its tray menu and try again. No qBittorrent process was force-terminated.",
                     "Update deferred", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -623,7 +694,7 @@ namespace QUpdater
                 if (MessageBox.Show($"Verified the official signature and SHA-256 for {release.FileName}.\n\n" +
                     $"Install to {Path.GetDirectoryName(exe)}? qBittorrent must close. Windows may request elevation.",
                     "Install verified update", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-                if (!await CloseQbittorrentGracefully() || QbittorrentRunning())
+                if (!await CloseQbittorrentGracefully(exe) || QbittorrentRunning())
                 {
                     MessageBox.Show("qBittorrent is still running. Exit from its tray menu and retry. No process was force-terminated.");
                     return;
