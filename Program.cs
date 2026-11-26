@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 using System.IO;
 using System.Text.Json;
+using System.Threading;
 
 namespace QUpdater
 {
@@ -18,21 +19,40 @@ namespace QUpdater
         private bool isChecking = false;
 
         [STAThread]
-        static void Main()
+        static int Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--self-test")
+                return SelfTest();
+            using var mutex = new Mutex(true, @"Local\qUpdater.SecurityHardened", out bool firstInstance);
+            if (!firstInstance) return 0;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             var program = new Program();
             program.Initialize();
             Application.Run();
+            return 0;
         }
 
         public void Initialize()
         {
-            httpClient = new HttpClient();
+            httpClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
+            {
+                Timeout = TimeSpan.FromSeconds(30)
+            };
             SetupTrayIcon();
-            CheckForUpdates();
+            EventHandler onIdle = null;
+            onIdle = async (sender, args) =>
+            {
+                Application.Idle -= onIdle;
+                await CheckForUpdates();
+            };
+            Application.Idle += onIdle;
+            Application.ApplicationExit += (sender, args) =>
+            {
+                trayIcon.Dispose();
+                httpClient.Dispose();
+            };
         }
 
         private void SetupTrayIcon()
@@ -70,7 +90,12 @@ namespace QUpdater
             contextMenu.Items.Add("Check for Updates", null, async (s, e) => await CheckForUpdates());
             contextMenu.Items.Add("About", null, ShowAbout);
             contextMenu.Items.Add("-");
-            contextMenu.Items.Add("Exit", null, (s, e) => Application.Exit());
+            contextMenu.Items.Add("Exit", null, (s, e) =>
+            {
+                if (isChecking)
+                    MessageBox.Show("An update check or installation is in progress.");
+                else Application.Exit();
+            });
 
             trayIcon.ContextMenuStrip = contextMenu;
         }
@@ -92,8 +117,6 @@ namespace QUpdater
         {
             // 1) Try direct version from dedicated qBittorrent keys (both 64/32-bit, HKLM/HKCU)
             string directVersion = TryReadQbittorrentVersionFromRegistry();
-            if (!string.IsNullOrWhiteSpace(directVersion))
-                return directVersion;
 
             // 2) Try to resolve the executable path from registry (App Paths / Uninstall entries)
             string exePath = TryGetQbittorrentExePathFromRegistry();
@@ -113,7 +136,7 @@ namespace QUpdater
                     return versionFromExe;
             }
 
-            return null;
+            return directVersion;
         }
 
         private string TryReadQbittorrentVersionFromRegistry()
@@ -261,7 +284,7 @@ namespace QUpdater
                                             var commaIdx = cleaned.IndexOf(',');
                                             if (commaIdx >= 0) cleaned = cleaned.Substring(0, commaIdx);
                                             cleaned = cleaned.Trim('"');
-                                            if (File.Exists(cleaned)) return cleaned;
+                                            if (File.Exists(cleaned) && string.Equals(Path.GetFileName(cleaned), "qbittorrent.exe", StringComparison.OrdinalIgnoreCase)) return cleaned;
                                         }
 
                                         // As a final hint, UninstallString may live next to the exe
@@ -334,170 +357,191 @@ namespace QUpdater
             return null;
         }
 
-        private async Task<(string version, string url)> GetLatestVersion()
+        private static void Log(string message)
         {
             try
             {
-                var response = await httpClient.GetStringAsync("https://sourceforge.net/projects/qbittorrent/best_release.json");
-                using (JsonDocument document = JsonDocument.Parse(response))
-                {
-                    var root = document.RootElement;
-                    var windows = root.GetProperty("platform_releases").GetProperty("windows");
-                    var filename = windows.GetProperty("filename").GetString();
-                    var url = windows.GetProperty("url").GetString();
-
-                    var match = Regex.Match(filename, @"qbittorrent_(\d+\.\d+\.\d+)_x64_setup\.exe");
-                    if (match.Success)
-                    {
-                        return (match.Groups[1].Value, url);
-                    }
-                }
+                var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "qUpdater");
+                Directory.CreateDirectory(directory);
+                var path = Path.Combine(directory, "updater.log");
+                if (File.Exists(path) && new FileInfo(path).Length > 1024 * 1024)
+                    File.Move(path, path + ".old", true);
+                File.AppendAllText(path, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Error checking for updates: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            return (null, null);
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
 
-        private async Task DownloadAndInstall(string version, string url)
+        internal static Version ParseReleaseFilename(string filename)
         {
-            var result = MessageBox.Show(
-                $"A new version of qBittorrent ({version}) is available. Would you like to download and install it?",
-                "Update Available",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question
-            );
+            var match = Regex.Match(filename ?? "", @"(?:^|/)qbittorrent_(\d+\.\d+\.\d+)_x64_setup\.exe$",
+                RegexOptions.CultureInvariant);
+            if (!match.Success || !Version.TryParse(match.Groups[1].Value, out var version))
+                throw new InvalidDataException("Unrecognized stable x64 release metadata.");
+            return version;
+        }
 
-            if (result != DialogResult.Yes)
-                return;
-
-            var progressForm = new Form
-            {
-                Text = "Downloading Update",
-                Size = new Size(400, 150),
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                StartPosition = FormStartPosition.CenterScreen,
-                MaximizeBox = false,
-                MinimizeBox = false,
-                ControlBox = false,
-                TopMost = true
-            };
-
-            var label = new Label
-            {
-                Text = "Downloading qBittorrent update...",
-                AutoSize = true,
-                Location = new Point(10, 20)
-            };
-
-            var progressBar = new ProgressBar
-            {
-                Location = new Point(10, 50),
-                Size = new Size(365, 23),
-                Minimum = 0,
-                Maximum = 100,
-                Style = ProgressBarStyle.Continuous
-            };
-
-            var sizeLabel = new Label
-            {
-                Text = "0 MB / 0 MB",
-                AutoSize = true,
-                Location = new Point(10, 80)
-            };
-
-            progressForm.Controls.AddRange(new Control[] { label, progressBar, sizeLabel });
-            progressForm.Show();
-
+        private static int SelfTest()
+        {
             try
             {
-                var downloadPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    "Downloads",
-                    $"qbittorrent_{version}_x64_setup.exe"
-                );
-
-                using (var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+                if (ParseReleaseFilename("/qbittorrent/qbittorrent-5.1.2/qbittorrent_5.1.2_x64_setup.exe") != new Version(5, 1, 2))
+                    return 1;
+                foreach (var bad in new[] { "", "qbittorrent_5.1.2_x64_setup.exe.bak", "qbittorrent_5.1.2_beta_x64_setup.exe", "qbittorrent_5.1.2_x86_setup.exe" })
                 {
-                    var totalBytes = response.Content.Headers.ContentLength ?? 0;
-                    var totalMB = totalBytes / 1024.0 / 1024.0;
-
-                    using (var downloadStream = await response.Content.ReadAsStreamAsync())
-                    using (var fileStream = new FileStream(downloadPath, FileMode.Create))
-                    {
-                        var buffer = new byte[8192];
-                        var bytesRead = 0;
-                        var totalBytesRead = 0L;
-
-                        while ((bytesRead = await downloadStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                        {
-                            await fileStream.WriteAsync(buffer, 0, bytesRead);
-                            totalBytesRead += bytesRead;
-
-                            var progress = (int)((totalBytesRead * 100) / totalBytes);
-                            var downloadedMB = totalBytesRead / 1024.0 / 1024.0;
-
-                            progressBar.Value = progress;
-                            sizeLabel.Text = $"{downloadedMB:F1} MB / {totalMB:F1} MB";
-                            progressForm.Update();
-                        }
-                    }
+                    try { ParseReleaseFilename(bad); return 1; }
+                    catch (InvalidDataException) { }
                 }
-
-                progressForm.Close();
-
-                // Kill qBittorrent if running
-                foreach (var process in Process.GetProcessesByName("qbittorrent"))
-                {
-                    process.Kill();
-                    process.WaitForExit();
-                }
-
-                // Start installer
-                Process.Start(new ProcessStartInfo(downloadPath) { UseShellExecute = true });
+                return 0;
             }
-            catch (Exception ex)
+            catch { return 1; }
+        }
+
+        private async Task<Version> GetLatestVersion()
+        {
+            // SourceForge supplies a version hint, never an executable or download URL.
+            using var response = await httpClient.GetAsync(
+                "https://sourceforge.net/projects/qbittorrent/best_release.json");
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            return ParseReleaseFilename(document.RootElement.GetProperty("platform_releases")
+                .GetProperty("windows").GetProperty("filename").GetString());
+        }
+
+        private static string FindWinGet()
+        {
+            // Avoid finding an arbitrary executable via PATH or the working directory.
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "WindowsApps", "winget.exe");
+            if (!File.Exists(path))
+                throw new FileNotFoundException("Windows App Installer (WinGet) is required. Install or repair it through Microsoft Store.");
+            return path;
+        }
+
+        private static async Task<int> RunWinGet(string executable, bool preflight, params string[] arguments)
+        {
+            var info = new ProcessStartInfo(executable)
             {
-                progressForm.Close();
-                MessageBox.Show($"Error downloading update: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System)
+            };
+            foreach (var argument in arguments) info.ArgumentList.Add(argument);
+            using var process = Process.Start(info) ?? throw new InvalidOperationException("Could not start WinGet.");
+            var output = process.StandardOutput.ReadToEndAsync();
+            var error = process.StandardError.ReadToEndAsync();
+            if (preflight)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+                try { await process.WaitForExitAsync(timeout.Token); }
+                catch (OperationCanceledException)
+                {
+                    try { if (!process.HasExited) process.Kill(); }
+                    catch (InvalidOperationException) { }
+                    throw new TimeoutException("WinGet package lookup timed out.");
+                }
             }
+            else
+            {
+                // Never forcibly interrupt an installer which may be writing application files.
+                await process.WaitForExitAsync();
+            }
+            await Task.WhenAll(output, error);
+            Log($"WinGet exit code: 0x{unchecked((uint)process.ExitCode):X8}");
+            return process.ExitCode;
+        }
+
+        private static bool QbittorrentRunning()
+        {
+            var processes = Process.GetProcessesByName("qbittorrent");
+            try { return processes.Length != 0; }
+            finally { foreach (var process in processes) process.Dispose(); }
+        }
+
+        private static async Task<bool> CloseQbittorrentGracefully()
+        {
+            var processes = Process.GetProcessesByName("qbittorrent");
+            try
+            {
+                foreach (var process in processes)
+                {
+                    try { if (!process.HasExited) process.CloseMainWindow(); }
+                    catch (InvalidOperationException) { }
+                    catch (System.ComponentModel.Win32Exception) { }
+                }
+                for (var attempt = 0; attempt < 30; attempt++)
+                {
+                    if (!QbittorrentRunning()) return true;
+                    await Task.Delay(1000);
+                }
+                return !QbittorrentRunning();
+            }
+            finally { foreach (var process in processes) process.Dispose(); }
+        }
+
+        private async Task DownloadAndInstall(Version version)
+        {
+            var winget = FindWinGet();
+            if (MessageBox.Show($"qBittorrent {version} is available. Install via Windows Package Manager?\n\n" +
+                "qBittorrent must exit first. WinGet validates the installer hash and may show an installer or UAC prompt.",
+                "Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            // No silent source agreements or hash-check overrides.
+            if (await RunWinGet(winget, true, "show", "--id", "qBittorrent.qBittorrent", "--exact", "--source", "winget",
+                "--version", version.ToString(), "--disable-interactivity") != 0)
+                throw new InvalidOperationException("This version is unavailable through WinGet, or its source needs setup. Run winget source update in a terminal and retry.");
+
+            if (!await CloseQbittorrentGracefully())
+            {
+                MessageBox.Show("qBittorrent is still running. Exit using its tray menu and try again. No qBittorrent process was force-terminated.",
+                    "Update deferred", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (QbittorrentRunning()) throw new InvalidOperationException("qBittorrent restarted; update deferred.");
+
+            using var progress = new Form { Text = "Installing qBittorrent update", Size = new Size(450, 120),
+                StartPosition = FormStartPosition.CenterScreen, FormBorderStyle = FormBorderStyle.FixedDialog,
+                ControlBox = false, MaximizeBox = false, MinimizeBox = false };
+            progress.Controls.Add(new Label { Text = "WinGet is downloading and installing the verified package...", AutoSize = true,
+                Location = new Point(10, 10) });
+            progress.Controls.Add(new ProgressBar { Style = ProgressBarStyle.Marquee, Location = new Point(10, 40), Size = new Size(400, 20) });
+            progress.Show();
+            try
+            {
+                int result = await RunWinGet(winget, false, "upgrade", "--id", "qBittorrent.qBittorrent", "--exact",
+                    "--source", "winget", "--version", version.ToString(), "--interactive", "--disable-interactivity");
+                if (result != 0) throw new InvalidOperationException($"WinGet failed (0x{unchecked((uint)result):X8}). Consult WinGet diagnostics.");
+                var exe = TryGetQbittorrentExePathFromRegistry() ?? ProbeCommonInstallLocationsAcrossDrives();
+                if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe) ||
+                    !Version.TryParse(TryGetVersionFromExecutable(exe), out var installed) || installed < version)
+                    throw new InvalidOperationException("WinGet reported success, but the installed executable version could not be verified.");
+                Log($"Verified installed version {installed}.");
+                MessageBox.Show($"qBittorrent {installed} installed successfully.", "Update complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            finally { progress.Close(); }
         }
 
         private async Task CheckForUpdates()
         {
-            if (isChecking)
-                return;
-
+            if (isChecking) return;
             isChecking = true;
-
             try
             {
                 var currentVersion = GetInstalledVersion();
-                if (string.IsNullOrEmpty(currentVersion))
-                {
-                    MessageBox.Show("Could not detect qBittorrent installation.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-
-                var (latestVersion, downloadUrl) = await GetLatestVersion();
-                if (!string.IsNullOrEmpty(latestVersion))
-                {
-                    Version current = Version.Parse(currentVersion);
-                    Version latest = Version.Parse(latestVersion);
-
-                    if (latest > current)
-                    {
-                        await DownloadAndInstall(latestVersion, downloadUrl);
-                    }
-                    // Silently do nothing if already up to date
-                }
+                if (!Version.TryParse(currentVersion, out var current))
+                    throw new InvalidOperationException("Could not determine the installed qBittorrent version.");
+                // Normalize to the three-part version used by release metadata.
+                current = new Version(current.Major, current.Minor, Math.Max(0, current.Build));
+                var latest = await GetLatestVersion();
+                Log($"Installed {current}; available {latest}.");
+                if (latest > current) await DownloadAndInstall(latest);
             }
-            finally
+            catch (Exception ex)
             {
-                isChecking = false;
+                Log(ex.Message);
+                MessageBox.Show(ex.Message, "qUpdater", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+            finally { isChecking = false; }
         }
     }
 }
