@@ -1,19 +1,8 @@
 @echo off
-echo Building qUpdater...
-
-:: Clean previous builds
-if exist "bin" rd /s /q "bin"
-if exist "obj" rd /s /q "obj"
-
-:: Build and publish
-dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true
-
-:: Copy the executable to the root directory
-echo.
-echo Copying executable to root directory...
-copy /Y "bin\Release\net9.0-windows\win-x64\publish\qUpdater.exe" "qUpdater.exe"
-
-echo.
-echo Build complete! The executable is: qUpdater.exe
-echo.
-pause
+setlocal
+cd /d "%~dp0"
+dotnet publish QUpdater.csproj -c Release -r win-x64 --self-contained true -o publish
+if errorlevel 1 exit /b 1
+copy /y "publish\qUpdater.exe" "qUpdater.exe" >nul
+if errorlevel 1 exit /b 1
+echo Build complete: qUpdater.exe

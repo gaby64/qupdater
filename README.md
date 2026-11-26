@@ -1,24 +1,24 @@
-# qUpdater
+# qUpdater – standalone security-hardening draft
 
-Automatically checks for qBittorrent updates on system startup and helps you install them fast.
+Fork of [celgost/qupdater](https://github.com/celgost/qupdater). No upstream license file was found; confirm redistribution rights with the original author before distributing builds outside the GitHub fork.
 
-The application will:
-- Run automatically on system startup
-- Show in the system tray
-- Check for updates when started
-- Won't show if there is no update available
-- Download directly the last release files
-  
-## Install:
+## Direct updates (default)
 
-1. Unzip the zip from releases page
-2. Run `install.bat` as administrator
-3. Enjoy
+Checks the official Windows download page for stable x64 releases and exact installer/signature links and SHA-256 values. Downloads from HTTPS SourceForge mirrors only, follows at most five validated redirects, bounds download sizes and times, verifies SHA-256 AND the detached OpenPGP binary signature against the embedded primary public key fingerprint D8F3DA77AAC6741053599C136E4A2D025B7CC9A2 (published at https://www.qbittorrent.org/download). The key file is taken from the upstream qBittorrent repository. Unknown key rotations, signing subkeys, weak digests, missing metadata, signature mismatches, or unexpected mirrors stop the update; there is no automatic fallback or bypass. OpenPGP verifies publisher identity independently of Authenticode, which upstream installers may lack. This does not guarantee absence of vulnerabilities or malware in an authentic upstream release. The Windows zone marker is retained; Windows protections and UAC remain in effect.
 
-## Uninstall
-1. Right-click the tray icon and select "Exit"
-2. Delete the program folder (in Program Files\qUpdater)
-3. Remove from startup:
-   - Open Registry Editor (regedit)
-   - Navigate to HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
-   - Delete the "qUpdater" entry
+The user selects the existing libtorrent variant on first update (standard, lt12, or lt20 if offered); no automatic switching. The tray offers startup-only, six-hour, and daily checks, optional restart after successful installation, and an explicit WinGet alternative for standard builds. Direct updates do not need WinGet or GnuPG. Downloads can be canceled, one transient HTTP failure is retried, files are removed after completion, and verification finishes before attempting graceful shutdown. Native shutdown is attempted first when the WebUI is enabled; if unavailable, WM_CLOSE is used. If qBittorrent remains running, exit it manually and retry. The official interactive NSIS installer receives the existing directory as its initial destination; the user should leave it unchanged. Success is confirmed by reading the executable version at that path. No qBittorrent process is forcibly terminated. Optional restart only occurs after direct update success if qBittorrent was previously running. Logs rotate in %LOCALAPPDATA%\qUpdater.
+
+## Build and install
+
+Windows x64, .NET 10 SDK for local builds; run build.bat, then install.bat as a normal user. WinGet is optional. The self-contained build uses BouncyCastle.Cryptography 2.7.0 for OpenPGP. Exit the old updater first; old Program Files installation is not automatically removed. Exit from the tray before uninstall.bat. Settings and logs remain. Portable/nonstandard installations and multi-user installation coordination are not supported.
+
+## Validation
+
+Windows CI publishes a self-contained executable and runs parser, pinned-key, URL rejection and hash mismatch smoke tests. The HTML test fixture is a snapshot of the official Windows release section, not runtime metadata. This is not an end-to-end installer test. Before production use, test real downloads and signatures for each variant, tampered signatures, truncated downloads, cancellation, redirect behavior, graceful shutdown when minimized, installer UAC refusal, original path preservation, successful upgrade/restart, and installation/uninstallation in a Windows VM. The pinned key must be updated through a reviewed source change if upstream changes signing keys. No live revocation/keyserver checks are made. If SourceForge changes mirror domains or the official page changes markup, direct updates fail closed until the parser or allowlist is reviewed.
+
+Upstream key: https://github.com/qbittorrent/qBittorrent/blob/master/5B7CC9A2.asc
+Website fixture: https://github.com/qbittorrent/qBittorrent-website/blob/master/_site/download.html
+
+## Native WebUI shutdown (v1.3.0)
+
+Reads WebUI enabled, port, HTTPS and username from the normal Windows profile's `%APPDATA%\qBittorrent\qBittorrent.ini`. After installer verification and user approval, the updater probes `/api/v2/app/version` and calls `POST /api/v2/app/shutdown` using the local WebUI only. If authentication is required, enter the username and password in a masked prompt; the session cookie stays in memory and credentials are not persisted or logged. Login is attempted once. No WebUI security settings are changed. No proxy, DNS or redirect is used; each IPv4 or IPv6 loopback connection must belong to the expected qBittorrent PID in the Windows TCP table before HTTP data is sent. HTTPS certificates must pass normal Windows validation for localhost (self-signed/untrusted certificates fall back). Nonstandard profiles, custom reverse proxies, and listeners not reachable via IPv4 or IPv6 loopback are not supported by auto-detection. If a native request is accepted or the connection drops during shutdown, wait up to 60 seconds; do not interrupt a pending native shutdown. Otherwise try WM_CLOSE and wait 30 seconds. If any qBittorrent process remains, defer installation. No process is killed. Shutdown is limited to the detected executable and current Windows session; other/inaccessible instances defer the update. Native shutdown works with either update backend. Offline smoke tests cover INI parsing and mock API success, login, refusal and unrelated response; a loopback socket test verifies the current process owner and rejects a mismatched PID for IPv4 and, when available, IPv6. Real qBittorrent ownership, TLS, credentials and tray shutdown still require integration testing.
